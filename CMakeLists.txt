@@ -15,6 +15,7 @@ endif (ZLIB_FOUND)
 cmake_minimum_required(VERSION 3.1)
 set(CMAKE_MACOSX_RPATH 1)
 set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if (WIN32)
   add_definitions(/bigobj)
