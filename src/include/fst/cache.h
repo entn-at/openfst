@@ -6,10 +6,8 @@
 #ifndef FST_CACHE_H_
 #define FST_CACHE_H_
 
+#include <algorithm>
 #include <functional>
-#include <unordered_map>
-using std::unordered_map;
-using std::unordered_multimap;
 #include <list>
 #include <vector>
 
@@ -18,6 +16,7 @@ using std::unordered_multimap;
 
 #include <fst/vector-fst.h>
 
+#include <unordered_map>
 
 DECLARE_bool(fst_default_cache_gc);
 DECLARE_int64(fst_default_cache_gc_limit);
@@ -125,19 +124,30 @@ class CacheState {
   // Adds one arc at a time with all needed book-keeping; use PushArc and
   // SetArcs for a more efficient alternative.
   void AddArc(const Arc &arc) {
+    IncrementNumEpsilons(arc);
     arcs_.push_back(arc);
-    if (arc.ilabel == 0) ++niepsilons_;
-    if (arc.olabel == 0) ++noepsilons_;
+  }
+
+  void AddArc(Arc &&arc) {
+    IncrementNumEpsilons(arc);
+    arcs_.push_back(std::move(arc));
   }
 
   // Adds one arc at a time with delayed book-keeping; finalize with SetArcs().
   void PushArc(const Arc &arc) { arcs_.push_back(arc); }
 
+  void PushArc(Arc &&arc) { arcs_.push_back(std::move(arc)); }
+
+  // Adds one arc at a time with delayed book-keeping; finalize with SetArcs().
+  template <class... T>
+  void EmplaceArc(T &&... ctor_args) {
+    arcs_.emplace_back(std::forward<T>(ctor_args)...);
+  }
+
   // Finalizes arcs book-keeping; call only once.
   void SetArcs() {
     for (const auto &arc : arcs_) {
-      if (arc.ilabel == 0) ++niepsilons_;
-      if (arc.olabel == 0) ++noepsilons_;
+      IncrementNumEpsilons(arc);
     }
   }
 
@@ -145,8 +155,7 @@ class CacheState {
   void SetArc(const Arc &arc, size_t n) {
     if (arcs_[n].ilabel == 0) --niepsilons_;
     if (arcs_[n].olabel == 0) --noepsilons_;
-    if (arc.ilabel == 0) ++niepsilons_;
-    if (arc.olabel == 0) ++noepsilons_;
+    IncrementNumEpsilons(arc);
     arcs_[n] = arc;
   }
 
@@ -194,6 +203,12 @@ class CacheState {
   }
 
  private:
+  // Update the number of epsilons as a result of having added an arc.
+  void IncrementNumEpsilons(const Arc &arc) {
+    if (arc.ilabel == 0) ++niepsilons_;
+    if (arc.olabel == 0) ++noepsilons_;
+  }
+
   Weight final_;                         // Final weight.
   size_t niepsilons_;                    // # of input epsilons.
   size_t noepsilons_;                    // # of output epsilons.
@@ -249,6 +264,9 @@ class CacheState {
 //
 //   // Deletes all cached states.
 //   void Clear();
+//
+//   // Number of cached states.
+//   StateId CountStates();
 //
 //   // Iterates over cached states (in an arbitrary order); only needed if
 //   // opts.gc is true.
@@ -335,6 +353,11 @@ class VectorCacheStore {
     state_list_.clear();
   }
 
+  StateId CountStates() const {
+    return std::count_if(state_vec_.begin(), state_vec_.end(),
+                         [](const State *s) { return s != nullptr; });
+  }
+
   // Iterates over cached states (in an arbitrary order); only works if GC is
   // enabled (o.w. avoiding state_list_ overhead).
   bool Done() const { return iter_ == state_list_.end(); }
@@ -385,8 +408,8 @@ class HashCacheStore {
 
   using StateMap =
       std::unordered_map<StateId, State *, std::hash<StateId>,
-                         std::equal_to<StateId>,
-                         PoolAllocator<std::pair<const StateId, State *>>>;
+                          std::equal_to<StateId>,
+                          PoolAllocator<std::pair<const StateId, State *>>>;
 
   // Required constructors/assignment operators.
   explicit HashCacheStore(const CacheOptions &opts) {
@@ -442,6 +465,8 @@ class HashCacheStore {
     }
     state_map_.clear();
   }
+
+  StateId CountStates() const { return state_map_.size(); }
 
   // Iterates over cached states (in an arbitrary order).
   bool Done() const { return iter_ == state_map_.end(); }
@@ -575,6 +600,8 @@ class FirstCacheStore {
     cache_first_state_ = nullptr;
   }
 
+  StateId CountStates() const { return store_.CountStates(); }
+
   // Iterates over cached states (in an arbitrary order). Only needed if GC is
   // enabled.
   bool Done() const { return store_.Done(); }
@@ -683,6 +710,8 @@ class GCCacheStore {
     store_.Clear();
     cache_size_ = 0;
   }
+
+  StateId CountStates() const { return store_.CountStates(); }
 
   // Iterates over cached states (in an arbitrary order); only needed if GC is
   // enabled.
@@ -894,11 +923,25 @@ class CacheBaseImpl : public FstImpl<typename State::Arc> {
 #endif
 
   // Adds a single arc to a state but delays cache book-keeping. SetArcs must
-  // be called when all PushArc calls at a state are complete. Do not mix with
-  // calls to AddArc.
+  // be called when all PushArc and EmplaceArc calls at a state are complete.
+  // Do not mix with calls to AddArc.
   void PushArc(StateId s, const Arc &arc) {
     auto *state = cache_store_->GetMutableState(s);
     state->PushArc(arc);
+  }
+
+  void PushArc(StateId s, Arc &&arc) {
+    auto *state = cache_store_->GetMutableState(s);
+    state->PushArc(std::move(arc));
+  }
+
+  // Adds a single arc to a state but delays cache book-keeping. SetArcs must
+  // be called when all PushArc and EmplaceArc calls at a state are complete.
+  // Do not mix with calls to AddArc.
+  template <class... T>
+  void EmplaceArc(StateId s, T &&... ctor_args) {
+    auto *state = cache_store_->GetMutableState(s);
+    state->EmplaceArc(std::forward<T>(ctor_args)...);
   }
 
   // Marks arcs of a state as cached and does cache book-keeping after all
@@ -1267,6 +1310,8 @@ class ExpanderCacheStore {
     explicit StateBuilder(State *state_) : state(state_) {}
 
     void AddArc(const Arc &arc) { state->PushArc(arc); }
+
+    void AddArc(Arc &&arc) { state->PushArc(std::move(arc)); }
 
     void SetFinal(Weight weight) { state->SetFinal(std::move(weight)); }
   };
